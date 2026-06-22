@@ -1,10 +1,12 @@
 //! Building blocks shared across all RTK modules.
 
 pub mod args_utils;
+pub mod compact;
 pub mod config;
 pub mod constants;
 pub mod display_helpers;
 pub mod filter;
+pub mod raw_cache;
 pub mod runner;
 pub mod stream;
 pub mod tee;

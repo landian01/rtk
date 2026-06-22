@@ -54,22 +54,36 @@ unknown command output -> obvious shape classifier -> safe compaction or passthr
 
 ### 1. Raw Cache
 
+默认优先节省 token。只有在确实压缩了输出时，才写 raw cache，并在输出尾部追加最小取回句柄：
+
+```text
+[raw: rtk raw show abc123]
+```
+
+没有压缩收益、解析失败或短输出 passthrough 时，不写 raw cache，也不追加 raw id。
+
+需要调试压缩质量时，可以显式打开 metadata/raw cache：
+
+```powershell
+$env:RTK_COMPACT_METADATA='always'
+```
+
 压缩前保存原始 stdout/stderr/exit code 到用户级缓存目录，例如：
 
 ```text
 C:/Users/Administrator/.codex/compact-cache/
 ```
 
-压缩输出末尾附带短标记：
+调试模式下，在压缩输出末尾附带完整 metadata 标记：
 
 ```text
 [compact: adapter=git.diff raw=184KB shown=12KB saved=93% raw=abc123]
 ```
 
-后续提供取回命令：
+取回命令：
 
 ```powershell
-compact raw show abc123
+rtk raw show abc123
 ```
 
 ### 2. Metadata
@@ -85,7 +99,7 @@ compact raw show abc123
 - 是否 passthrough
 - raw cache id
 
-metadata 既用于输出尾部，也用于本地统计。
+metadata 默认不进入 agent 可见输出；默认只在压缩成功时输出 `[raw: rtk raw show <id>]`。只有 `RTK_COMPACT_METADATA=always` 时才输出尾部完整调试标记。
 
 ### 3. Passthrough Guard
 
@@ -105,7 +119,7 @@ metadata 既用于输出尾部，也用于本地统计。
 - 大数组只展示前后样本。
 - 优先保留包含 `error`、`failed`、`warning`、`exception` 的项。
 - 输出明确说明省略了多少项。
-- 原文缓存可取回完整 JSON。
+- 调试模式下原文缓存可取回完整 JSON。
 
 ## Dogfood 流程
 

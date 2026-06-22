@@ -1,6 +1,7 @@
 //! Filters git output — log, status, diff, and more — keeping just the essential info.
 
 use crate::core::args_utils;
+use crate::core::compact;
 use crate::core::stream::{
     self, exec_capture, CaptureResult, FilterMode, LineHandler, LineStreamFilter, StdinMode,
 };
@@ -47,6 +48,38 @@ fn git_cmd_c_locale(global_args: &[String]) -> Command {
     let mut cmd = git_cmd(global_args);
     cmd.env("LC_ALL", "C");
     cmd
+}
+
+struct GitFinalize<'a> {
+    adapter: &'a str,
+    original_cmd: &'a str,
+    rtk_cmd: &'a str,
+    raw_stdout: &'a str,
+    raw_stderr: &'a str,
+    filter_input: &'a str,
+    filtered: String,
+    exit_code: i32,
+}
+
+fn finalize_print_track(timer: &tracking::TimedExecution, args: GitFinalize<'_>) {
+    let finalized = compact::finalize(compact::FinalizeRequest {
+        adapter: args.adapter,
+        command: args.original_cmd,
+        raw_stdout: args.raw_stdout,
+        raw_stderr: args.raw_stderr,
+        filter_input: args.filter_input,
+        filtered: args.filtered,
+        exit_code: args.exit_code,
+        elapsed_ms: timer.elapsed_ms(),
+        emit_metadata: true,
+    });
+    println!("{}", finalized.output);
+    timer.track(
+        args.original_cmd,
+        args.rtk_cmd,
+        args.filter_input,
+        &finalized.output,
+    );
 }
 
 fn uses_compact_status_path(args: &[String]) -> bool {
@@ -118,12 +151,13 @@ fn run_diff(
     let wants_stat = args
         .iter()
         .any(|arg| arg == "--stat" || arg == "--numstat" || arg == "--shortstat");
+    let wants_check = args.iter().any(|arg| arg == "--check");
 
     // Check if user wants compact diff (default RTK behavior)
     let wants_compact = !args.iter().any(|arg| arg == "--no-compact");
 
-    if wants_stat || !wants_compact {
-        // User wants stat or explicitly no compacting - pass through directly
+    if wants_stat || wants_check || !wants_compact {
+        // User wants stat/check output or explicitly no compacting - pass through directly.
         let mut cmd = git_cmd(global_args);
         cmd.arg("diff");
         for arg in args {
@@ -134,22 +168,30 @@ fn run_diff(
         }
 
         let result = exec_capture(&mut cmd).context("Failed to run git diff")?;
+        let combined = result.combined();
+        let filtered = if wants_check {
+            compact_git_diff_check_output(&combined)
+        } else {
+            combined.clone()
+        };
 
-        if !result.success() {
-            eprintln!("{}", result.stderr);
-            return Ok(result.exit_code);
-        }
-
-        println!("{}", result.stdout.trim());
-
-        timer.track(
-            &format!("git diff {}", args.join(" ")),
-            &format!("rtk git diff {} (passthrough)", args.join(" ")),
-            &result.stdout,
-            &result.stdout,
+        let original_cmd = format!("git diff {}", args.join(" "));
+        let rtk_cmd = format!("rtk git diff {} (passthrough)", args.join(" "));
+        finalize_print_track(
+            &timer,
+            GitFinalize {
+                adapter: "git.diff",
+                original_cmd: &original_cmd,
+                rtk_cmd: &rtk_cmd,
+                raw_stdout: &result.stdout,
+                raw_stderr: &result.stderr,
+                filter_input: &combined,
+                filtered,
+                exit_code: result.exit_code,
+            },
         );
 
-        return Ok(0);
+        return Ok(result.exit_code);
     }
 
     // Default RTK behavior: stat first, then compacted diff
@@ -179,9 +221,6 @@ fn run_diff(
         eprintln!("Git diff summary:");
     }
 
-    // Print stat summary first
-    println!("{}", result.stdout.trim());
-
     // Now get actual diff but compact it
     let mut diff_cmd = git_cmd(global_args);
     diff_cmd.arg("diff");
@@ -191,23 +230,96 @@ fn run_diff(
 
     let diff_result = exec_capture(&mut diff_cmd).context("Failed to run git diff")?;
 
-    let mut final_output = result.stdout.clone();
+    let mut final_output = result.stdout.trim().to_string();
     if !diff_result.stdout.is_empty() {
-        println!("\nChanges:");
         let compacted = compact_diff(&diff_result.stdout, max_lines.unwrap_or(500));
-        println!("{}", compacted);
-        final_output.push_str("\nChanges:\n");
+        if !final_output.is_empty() {
+            final_output.push_str("\n\n");
+        }
+        final_output.push_str("Changes:\n");
         final_output.push_str(&compacted);
     }
 
-    timer.track(
-        &format!("git diff {}", args.join(" ")),
-        &format!("rtk git diff {}", args.join(" ")),
-        &format!("{}\n{}", result.stdout, diff_result.stdout),
-        &final_output,
+    let original_cmd = format!("git diff {}", args.join(" "));
+    let rtk_cmd = format!("rtk git diff {}", args.join(" "));
+    let raw_stdout = format!("{}\n{}", result.stdout, diff_result.stdout);
+    let raw_stderr = format!("{}{}", result.stderr, diff_result.stderr);
+    finalize_print_track(
+        &timer,
+        GitFinalize {
+            adapter: "git.diff",
+            original_cmd: &original_cmd,
+            rtk_cmd: &rtk_cmd,
+            raw_stdout: &raw_stdout,
+            raw_stderr: &raw_stderr,
+            filter_input: &raw_stdout,
+            filtered: final_output,
+            exit_code: diff_result.exit_code,
+        },
     );
 
-    Ok(0)
+    Ok(diff_result.exit_code)
+}
+
+fn compact_git_diff_check_output(output: &str) -> String {
+    const MIN_WARNINGS_TO_COMPACT: usize = 2;
+    const MAX_PATHS_PER_GROUP: usize = 40;
+
+    let mut other_lines = Vec::new();
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    let mut warning_count = 0usize;
+
+    for line in output.lines() {
+        if let Some((path, conversion)) = parse_line_ending_warning(line) {
+            warning_count += 1;
+            if let Some((_, paths)) = groups.iter_mut().find(|(group, _)| group == &conversion) {
+                paths.push(path);
+            } else {
+                groups.push((conversion, vec![path]));
+            }
+        } else if !line.trim().is_empty() {
+            other_lines.push(line.to_string());
+        }
+    }
+
+    if warning_count < MIN_WARNINGS_TO_COMPACT {
+        return output.trim_end().to_string();
+    }
+
+    let mut result = other_lines;
+    if !result.is_empty() {
+        result.push(String::new());
+    }
+    result.push(format!(
+        "warning: {} working-copy line-ending conversion warnings",
+        warning_count
+    ));
+
+    for (conversion, paths) in groups {
+        result.push(format!("  {} next time Git touches:", conversion));
+        for path in paths.iter().take(MAX_PATHS_PER_GROUP) {
+            result.push(format!("    {}", path));
+        }
+        if paths.len() > MAX_PATHS_PER_GROUP {
+            result.push(format!("    ... +{} more", paths.len() - MAX_PATHS_PER_GROUP));
+        }
+    }
+
+    result.join("\n")
+}
+
+fn parse_line_ending_warning(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix("warning: in the working copy of '")?;
+    let (path, message) = rest.split_once("', ")?;
+    let (from, rest) = message.split_once(" will be replaced by ")?;
+    let to = rest.strip_suffix(" the next time Git touches it")?;
+
+    match (from, to) {
+        ("LF", "CRLF") | ("CRLF", "LF") => {
+            Some((path.to_string(), format!("{} -> {}", from, to)))
+        }
+        _ => None,
+    }
 }
 
 fn run_show(
@@ -244,18 +356,31 @@ fn run_show(
         }
         if wants_blob_show {
             print!("{}", result.stdout);
+            timer.track(
+                &format!("git show {}", args.join(" ")),
+                &format!("rtk git show {} (passthrough)", args.join(" ")),
+                &result.stdout,
+                &result.stdout,
+            );
         } else {
-            println!("{}", result.stdout.trim());
+            let original_cmd = format!("git show {}", args.join(" "));
+            let rtk_cmd = format!("rtk git show {} (passthrough)", args.join(" "));
+            finalize_print_track(
+                &timer,
+                GitFinalize {
+                    adapter: "git.show",
+                    original_cmd: &original_cmd,
+                    rtk_cmd: &rtk_cmd,
+                    raw_stdout: &result.stdout,
+                    raw_stderr: &result.stderr,
+                    filter_input: &result.stdout,
+                    filtered: result.stdout.trim().to_string(),
+                    exit_code: result.exit_code,
+                },
+            );
         }
 
-        timer.track(
-            &format!("git show {}", args.join(" ")),
-            &format!("rtk git show {} (passthrough)", args.join(" ")),
-            &result.stdout,
-            &result.stdout,
-        );
-
-        return Ok(0);
+        return Ok(result.exit_code);
     }
 
     // Get raw output for tracking
@@ -279,7 +404,7 @@ fn run_show(
         eprintln!("{}", summary_result.stderr);
         return Ok(summary_result.exit_code);
     }
-    println!("{}", summary_result.stdout.trim());
+    let mut final_output = summary_result.stdout.trim().to_string();
 
     // Step 2: --stat summary
     let mut stat_cmd = git_cmd(global_args);
@@ -290,7 +415,10 @@ fn run_show(
     let stat_result = exec_capture(&mut stat_cmd).context("Failed to run git show --stat")?;
     let stat_text = stat_result.stdout.trim();
     if !stat_text.is_empty() {
-        println!("{}", stat_text);
+        if !final_output.is_empty() {
+            final_output.push('\n');
+        }
+        final_output.push_str(stat_text);
     }
 
     // Step 3: compacted diff
@@ -302,24 +430,38 @@ fn run_show(
     let diff_result = exec_capture(&mut diff_cmd).context("Failed to run git show (diff)")?;
     let diff_text = diff_result.stdout.trim();
 
-    let mut final_output = summary_result.stdout.clone();
     if !diff_text.is_empty() {
-        if verbose > 0 {
-            println!("\nChanges:");
-        }
         let compacted = compact_diff(diff_text, max_lines.unwrap_or(500));
-        println!("{}", compacted);
-        final_output.push_str(&format!("\n{}", compacted));
+        if verbose > 0 && !final_output.is_empty() {
+            final_output.push_str("\nChanges:");
+        }
+        if !final_output.is_empty() {
+            final_output.push('\n');
+        }
+        final_output.push_str(&compacted);
     }
 
-    timer.track(
-        &format!("git show {}", args.join(" ")),
-        &format!("rtk git show {}", args.join(" ")),
-        &raw_output,
-        &final_output,
+    let original_cmd = format!("git show {}", args.join(" "));
+    let rtk_cmd = format!("rtk git show {}", args.join(" "));
+    let raw_stderr = format!(
+        "{}{}{}",
+        summary_result.stderr, stat_result.stderr, diff_result.stderr
+    );
+    finalize_print_track(
+        &timer,
+        GitFinalize {
+            adapter: "git.show",
+            original_cmd: &original_cmd,
+            rtk_cmd: &rtk_cmd,
+            raw_stdout: &raw_output,
+            raw_stderr: &raw_stderr,
+            filter_input: &raw_output,
+            filtered: final_output,
+            exit_code: diff_result.exit_code,
+        },
     );
 
-    Ok(0)
+    Ok(diff_result.exit_code)
 }
 
 fn is_blob_show_arg(arg: &str) -> bool {
@@ -489,13 +631,20 @@ fn run_log(
 
     // Post-process: truncate long messages, cap lines only if RTK set the default
     let filtered = filter_log_output(&result.stdout, limit, user_set_limit, has_format_flag);
-    println!("{}", filtered);
-
-    timer.track(
-        &format!("git log {}", args.join(" ")),
-        &format!("rtk git log {}", args.join(" ")),
-        &result.stdout,
-        &filtered,
+    let original_cmd = format!("git log {}", args.join(" "));
+    let rtk_cmd = format!("rtk git log {}", args.join(" "));
+    finalize_print_track(
+        &timer,
+        GitFinalize {
+            adapter: "git.log",
+            original_cmd: &original_cmd,
+            rtk_cmd: &rtk_cmd,
+            raw_stdout: &result.stdout,
+            raw_stderr: &result.stderr,
+            filter_input: &result.stdout,
+            filtered,
+            exit_code: result.exit_code,
+        },
     );
 
     Ok(0)
@@ -840,16 +989,23 @@ fn run_status(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
 
         // Apply minimal filtering: strip ANSI, remove hints, empty lines
         let filtered = filter_status_with_args(&result.stdout);
-        print!("{}", filtered);
-
-        timer.track(
-            &format!("git status {}", args.join(" ")),
-            &format!("rtk git status {}", args.join(" ")),
-            &result.stdout,
-            &filtered,
+        let original_cmd = format!("git status {}", args.join(" "));
+        let rtk_cmd = format!("rtk git status {}", args.join(" "));
+        finalize_print_track(
+            &timer,
+            GitFinalize {
+                adapter: "git.status",
+                original_cmd: &original_cmd,
+                rtk_cmd: &rtk_cmd,
+                raw_stdout: &result.stdout,
+                raw_stderr: &result.stderr,
+                filter_input: &result.stdout,
+                filtered,
+                exit_code: result.exit_code,
+            },
         );
 
-        return Ok(0);
+        return Ok(result.exit_code);
     }
 
     let mut raw_cmd = git_cmd_c_locale(global_args);
@@ -892,8 +1048,6 @@ fn run_status(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
         None => formatted,
     };
 
-    println!("{}", final_output);
-
     let original_cmd = if args.is_empty() {
         "git status".to_string()
     } else {
@@ -905,9 +1059,21 @@ fn run_status(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
         format!("rtk git status {}", args.join(" "))
     };
 
-    timer.track(&original_cmd, &rtk_cmd, &raw_output, &final_output);
+    finalize_print_track(
+        &timer,
+        GitFinalize {
+            adapter: "git.status",
+            original_cmd: &original_cmd,
+            rtk_cmd: &rtk_cmd,
+            raw_stdout: &raw_output,
+            raw_stderr: &result.stderr,
+            filter_input: &raw_output,
+            filtered: final_output,
+            exit_code: result.exit_code,
+        },
+    );
 
-    Ok(0)
+    Ok(result.exit_code)
 }
 
 fn run_add(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> {
@@ -2676,6 +2842,45 @@ no changes added to commit (use "git add" and/or "git commit -a")
             "Expected '50 lines truncated' (150 - 100 = 50), got:\n{}",
             result
         );
+    }
+
+    #[test]
+    fn test_compact_git_diff_check_output_groups_line_ending_warnings() {
+        let output = "\
+warning: in the working copy of 'Cargo.lock', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'Cargo.toml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/main.rs', LF will be replaced by CRLF the next time Git touches it
+";
+        let result = compact_git_diff_check_output(output);
+
+        assert!(result.contains("3 working-copy line-ending conversion warnings"));
+        assert!(result.contains("LF -> CRLF next time Git touches"));
+        assert!(result.contains("Cargo.lock"));
+        assert!(result.contains("src/main.rs"));
+        assert!(!result.contains("warning: in the working copy of"));
+    }
+
+    #[test]
+    fn test_compact_git_diff_check_output_preserves_real_check_errors() {
+        let output = "\
+src/main.rs:10: trailing whitespace.
+warning: in the working copy of 'Cargo.lock', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'Cargo.toml', LF will be replaced by CRLF the next time Git touches it
+";
+        let result = compact_git_diff_check_output(output);
+
+        assert!(result.contains("src/main.rs:10: trailing whitespace."));
+        assert!(result.contains("2 working-copy line-ending conversion warnings"));
+        assert!(result.contains("Cargo.toml"));
+    }
+
+    #[test]
+    fn test_compact_git_diff_check_output_leaves_single_warning_alone() {
+        let output =
+            "warning: in the working copy of 'Cargo.lock', LF will be replaced by CRLF the next time Git touches it\n";
+        let result = compact_git_diff_check_output(output);
+
+        assert_eq!(result, output.trim_end());
     }
 
     #[test]

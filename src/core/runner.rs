@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use std::process::Command;
 
+use crate::core::compact;
 use crate::core::stream::{self, FilterMode, StdinMode, StreamFilter};
 use crate::core::tracking;
 
@@ -112,13 +113,24 @@ where
         raw
     };
     let filtered = filter_fn(text_to_filter, exit_code);
+    let finalized = compact::finalize(compact::FinalizeRequest {
+        adapter: tool_name,
+        command: cmd_label,
+        raw_stdout: &result.raw_stdout,
+        raw_stderr: &result.raw_stderr,
+        filter_input: text_to_filter,
+        filtered,
+        exit_code,
+        elapsed_ms: timer.elapsed_ms(),
+        emit_metadata: !opts.no_trailing_newline,
+    });
 
     if let Some(label) = opts.tee_label {
-        print_with_hint(&filtered, raw, label, exit_code);
+        print_with_hint(&finalized.output, raw, label, exit_code);
     } else if opts.no_trailing_newline {
-        print!("{}", filtered);
+        print!("{}", finalized.output);
     } else {
-        println!("{}", filtered);
+        println!("{}", finalized.output);
     }
 
     let raw_for_tracking = if opts.filter_stdout_only {
@@ -130,7 +142,7 @@ where
         cmd_label,
         &format!("rtk {}", cmd_label),
         raw_for_tracking,
-        &filtered,
+        &finalized.output,
     );
     Ok(exit_code)
 }
@@ -181,6 +193,18 @@ pub fn run(
                 &result.raw,
                 &result.filtered,
             );
+            let marker = compact::append_metadata_only(
+                tool_name,
+                &cmd_label,
+                &result.raw_stdout,
+                &result.raw_stderr,
+                &result.filtered,
+                result.exit_code,
+                timer.elapsed_ms(),
+            );
+            if !marker.is_empty() {
+                println!("{}", marker);
+            }
             Ok(result.exit_code)
         }
         RunMode::Passthrough => {

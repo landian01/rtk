@@ -1,5 +1,6 @@
 //! Filters grep output by grouping matches by file.
 
+use crate::core::compact;
 use crate::core::stream::exec_capture;
 use crate::core::tracking;
 use crate::core::utils::resolved_command;
@@ -401,12 +402,24 @@ pub fn run(
             return Ok(exit_code);
         }
         let msg = format!("0 matches for '{}'", pattern_display);
-        println!("{}", msg);
+        let command = format!("grep -rn '{}' {}", pattern_display, path_display);
+        let finalized = compact::finalize(compact::FinalizeRequest {
+            adapter: "grep",
+            command: &command,
+            raw_stdout: &result.stdout,
+            raw_stderr: &result.stderr,
+            filter_input: &raw_output,
+            filtered: msg,
+            exit_code,
+            elapsed_ms: timer.elapsed_ms(),
+            emit_metadata: true,
+        });
+        println!("{}", finalized.output);
         timer.track(
-            &format!("grep -rn '{}' {}", pattern_display, path_display),
+            &command,
             "rtk grep",
             &raw_output,
-            &msg,
+            &finalized.output,
         );
         return Ok(exit_code);
     }
@@ -464,12 +477,24 @@ pub fn run(
         rtk_output.push_str(&format!("[+{} more]\n", total_matches - shown));
     }
 
-    print!("{}", rtk_output);
+    let command = format!("grep -rn '{}' {}", pattern_display, path_display);
+    let finalized = compact::finalize(compact::FinalizeRequest {
+        adapter: "grep",
+        command: &command,
+        raw_stdout: &result.stdout,
+        raw_stderr: &result.stderr,
+        filter_input: &raw_output,
+        filtered: rtk_output,
+        exit_code,
+        elapsed_ms: timer.elapsed_ms(),
+        emit_metadata: true,
+    });
+    println!("{}", finalized.output);
     timer.track(
-        &format!("grep -rn '{}' {}", pattern_display, path_display),
+        &command,
         "rtk grep",
         &raw_output,
-        &rtk_output,
+        &finalized.output,
     );
 
     Ok(exit_code)

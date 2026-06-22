@@ -1,8 +1,10 @@
 //! Inspects JSON structure without showing values, saving tokens on large payloads.
 
+use crate::core::compact;
 use crate::core::tracking;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
@@ -52,13 +54,21 @@ pub fn run(file: &Path, max_depth: usize, schema_only: bool, verbose: u8) -> Res
     } else {
         filter_json_compact(&content, max_depth)?
     };
-    println!("{}", output);
-    timer.track(
-        &format!("cat {}", file.display()),
-        "rtk json",
-        &content,
-        &output,
-    );
+    let adapter = if schema_only { "json.schema" } else { "json" };
+    let command = format!("cat {}", file.display());
+    let finalized = compact::finalize(compact::FinalizeRequest {
+        adapter,
+        command: &command,
+        raw_stdout: &content,
+        raw_stderr: "",
+        filter_input: &content,
+        filtered: output,
+        exit_code: 0,
+        elapsed_ms: timer.elapsed_ms(),
+        emit_metadata: true,
+    });
+    println!("{}", finalized.output);
+    timer.track(&command, "rtk json", &content, &finalized.output);
     Ok(())
 }
 
@@ -81,8 +91,20 @@ pub fn run_stdin(max_depth: usize, schema_only: bool, verbose: u8) -> Result<()>
     } else {
         filter_json_compact(&content, max_depth)?
     };
-    println!("{}", output);
-    timer.track("cat - (stdin)", "rtk json -", &content, &output);
+    let adapter = if schema_only { "json.schema" } else { "json" };
+    let finalized = compact::finalize(compact::FinalizeRequest {
+        adapter,
+        command: "cat - (stdin)",
+        raw_stdout: &content,
+        raw_stderr: "",
+        filter_input: &content,
+        filtered: output,
+        exit_code: 0,
+        elapsed_ms: timer.elapsed_ms(),
+        emit_metadata: true,
+    });
+    println!("{}", finalized.output);
+    timer.track("cat - (stdin)", "rtk json -", &content, &finalized.output);
     Ok(())
 }
 
@@ -116,8 +138,7 @@ fn compact_json(value: &Value, depth: usize, max_depth: usize) -> String {
             if arr.is_empty() {
                 format!("{}[]", indent)
             } else if arr.len() > 5 {
-                let first = compact_json(&arr[0], depth + 1, max_depth);
-                format!("{}[{}, ... +{} more]", indent, first.trim(), arr.len() - 1)
+                compact_large_array(arr, depth, max_depth)
             } else {
                 let items: Vec<String> = arr
                     .iter()
@@ -175,6 +196,90 @@ fn compact_json(value: &Value, depth: usize, max_depth: usize) -> String {
             }
         }
     }
+}
+
+fn compact_large_array(arr: &[Value], depth: usize, max_depth: usize) -> String {
+    let indent = "  ".repeat(depth);
+    let child_indent = "  ".repeat(depth + 1);
+    let selected = select_array_indices(arr);
+    let omitted = arr.len().saturating_sub(selected.len());
+
+    let mut lines = vec![format!("{}[", indent)];
+    for index in &selected {
+        let item = &arr[*index];
+        let rendered = compact_json(item, depth + 1, max_depth);
+        if is_simple_value(item) {
+            lines.push(format!("{}[{}]: {},", child_indent, index, rendered.trim()));
+        } else {
+            lines.push(format!("{}[{}]:", child_indent, index));
+            lines.push(rendered);
+        }
+    }
+
+    if omitted > 0 {
+        let signal_count = arr.iter().filter(|item| contains_signal(item)).count();
+        let signal_note = if signal_count > 0 {
+            format!(", {} signal-like", signal_count)
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "{}... {} items omitted ({} shown{}; first/last samples kept)",
+            child_indent,
+            omitted,
+            selected.len(),
+            signal_note
+        ));
+    }
+    lines.push(format!("{}]", indent));
+    lines.join("\n")
+}
+
+fn select_array_indices(arr: &[Value]) -> Vec<usize> {
+    let mut selected = BTreeSet::new();
+    let len = arr.len();
+
+    for index in 0..len.min(2) {
+        selected.insert(index);
+    }
+    for index in len.saturating_sub(2)..len {
+        selected.insert(index);
+    }
+    for (index, item) in arr.iter().enumerate() {
+        if contains_signal(item) {
+            selected.insert(index);
+            if selected.len() >= 8 {
+                break;
+            }
+        }
+    }
+
+    selected.into_iter().collect()
+}
+
+fn contains_signal(value: &Value) -> bool {
+    match value {
+        Value::String(s) => is_signal_text(s),
+        Value::Array(arr) => arr.iter().any(contains_signal),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| is_signal_text(key) || contains_signal(value)),
+        _ => false,
+    }
+}
+
+fn is_signal_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    ["error", "failed", "failure", "warning", "exception"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn is_simple_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+    )
 }
 
 /// Parse a JSON string and return its schema representation (types only, no values).
@@ -328,6 +433,28 @@ mod tests {
         let schema = extract_schema(&json, 0, 5);
         assert!(schema.contains("items"));
         assert!(schema.contains("(3)"));
+    }
+
+    #[test]
+    fn test_compact_large_array_keeps_edges_and_signal_items() {
+        let payload = r#"[
+            {"id": 1, "status": "ok"},
+            {"id": 2, "status": "ok"},
+            {"id": 3, "status": "ok"},
+            {"id": 4, "status": "failed", "error": "boom"},
+            {"id": 5, "status": "ok"},
+            {"id": 6, "status": "ok"},
+            {"id": 7, "status": "ok"}
+        ]"#;
+        let output = filter_json_compact(payload, 5).unwrap();
+        assert!(output.contains("[0]:"));
+        assert!(output.contains("[1]:"));
+        assert!(output.contains("[3]:"));
+        assert!(output.contains("[5]:"));
+        assert!(output.contains("[6]:"));
+        assert!(output.contains("items omitted"));
+        assert!(output.contains("signal-like"));
+        assert!(output.contains("boom"));
     }
 
     fn assert_value_truncated(payload: &str) {

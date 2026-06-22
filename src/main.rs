@@ -467,6 +467,12 @@ enum Commands {
         create: bool,
     },
 
+    /// Retrieve full raw output from the compact cache
+    Raw {
+        #[command(subcommand)]
+        command: RawCommands,
+    },
+
     /// Jest commands with compact output
     Jest {
         /// Additional jest arguments
@@ -789,6 +795,15 @@ enum HookCommands {
         /// Command to check
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RawCommands {
+    /// Print a cached raw command output by id
+    Show {
+        /// Raw cache id from a [raw: rtk raw show <id>] hint or debug marker
+        id: String,
     },
 }
 
@@ -1188,6 +1203,7 @@ const RTK_META_COMMANDS: &[&str] = &[
     "smart",
     "deps",
     "json",
+    "raw",
 ];
 
 fn run_fallback(parse_error: clap::Error) -> Result<i32> {
@@ -2040,6 +2056,19 @@ fn run_cli() -> Result<i32> {
                 println!("Created: {}", path.display());
             } else {
                 core::config::show_config()?;
+            }
+            0
+        }
+
+        Commands::Raw { command } => {
+            match command {
+                RawCommands::Show { id } => {
+                    let capture = core::raw_cache::load(&id)?;
+                    print!("{}", capture.stdout);
+                    if !capture.stderr.is_empty() {
+                        eprint!("{}", capture.stderr);
+                    }
+                }
             }
             0
         }
@@ -3079,6 +3108,17 @@ mod tests {
     }
 
     #[test]
+    fn test_raw_show_parses() {
+        let cli = Cli::try_parse_from(["rtk", "raw", "show", "abc123"]).unwrap();
+        match cli.command {
+            Commands::Raw {
+                command: RawCommands::Show { id },
+            } => assert_eq!(id, "abc123"),
+            _ => panic!("Expected Raw Show command"),
+        }
+    }
+
+    #[test]
     fn test_meta_command_list_is_complete() {
         // Verify all meta-commands are in the guard list by checking they parse with valid syntax
         let meta_cmds_that_parse = [
@@ -3091,6 +3131,7 @@ mod tests {
             vec!["rtk", "run", "-c", "echo hi"],
             vec!["rtk", "hook-audit"],
             vec!["rtk", "cc-economics"],
+            vec!["rtk", "raw", "show", "abc123"],
         ];
         for args in &meta_cmds_that_parse {
             let result = Cli::try_parse_from(args.iter());

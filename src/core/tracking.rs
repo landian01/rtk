@@ -1329,6 +1329,10 @@ impl TimedExecution {
         }
     }
 
+    pub fn elapsed_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+
     /// Track the command with elapsed time and token counts.
     ///
     /// Records the command execution with:
@@ -1354,7 +1358,7 @@ impl TimedExecution {
     /// timer.track("ls -la", "rtk ls", input, output);
     /// ```
     pub fn track(&self, original_cmd: &str, rtk_cmd: &str, input: &str, output: &str) {
-        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        let elapsed_ms = self.elapsed_ms();
         let input_tokens = estimate_tokens(input);
         let output_tokens = estimate_tokens(output);
 
@@ -1390,7 +1394,7 @@ impl TimedExecution {
     /// timer.track_passthrough("git tag", "rtk git tag");
     /// ```
     pub fn track_passthrough(&self, original_cmd: &str, rtk_cmd: &str) {
-        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        let elapsed_ms = self.elapsed_ms();
         // input_tokens=0, output_tokens=0 won't dilute savings statistics
         if let Ok(tracker) = Tracker::new() {
             let _ = tracker.record(original_cmd, rtk_cmd, 0, 0, elapsed_ms);
